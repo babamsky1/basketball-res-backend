@@ -9,12 +9,11 @@ from rest_framework.decorators import api_view, throttle_scope
 from rest_framework.response import Response
 from rest_framework import status
 
-from .models import Reservation, StripeEvent
-
-import stripe
+from .models import Reservation, PaymongoEvent
+from . import paymongo
 
 from django.conf import settings
-from django.http import HttpResponse
+from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.core.validators import validate_email
 from django.core.exceptions import ValidationError
@@ -387,70 +386,63 @@ def cancel_reservation(request, reservation_id):
             status=status.HTTP_400_BAD_REQUEST,
         )
 
+    def paid_payment_from(session_attributes):
+        # Return the paid payment object from a PayMongo Checkout Session
+        for payment in session_attributes.get("payments") or []:
+            attributes = payment.get("attributes") or {}
+            if attributes.get("status") == "paid":
+                return payment
+        return None
+
     try:
-        # Initialize Stripe using our secret key
-        client = stripe.StripeClient(settings.STRIPE_SECRET_KEY)
-
-        # Retrieve the Stripe Checkout Session if one exists
         session = None
+        session_attributes = {}
 
-        if reservation.stripe_session_id:
-            session = client.v1.checkout.sessions.retrieve(
-                reservation.stripe_session_id
-            )
+        # Retrieve the PayMongo Checkout Session if one exists
+        if reservation.paymongo_checkout_session_id:
+            try:
+                session = paymongo.retrieve_checkout_session(
+                    reservation.paymongo_checkout_session_id
+                )
+            except paymongo.PayMongoAPIError as error:
+                if error.status_code != 404:
+                    raise
+                session = None
 
-        # Check whether Stripe already received payment
-        is_paid = session is not None and session.payment_status == "paid"
+            if session:
+                session_attributes = (session.get("data") or {}).get("attributes") or {}
 
-        # Handle paid reservations
-        if reservation.status == "PA" or is_paid:
+        payment_id = reservation.paymongo_payment_id
+        paid_payment = paid_payment_from(session_attributes)
 
-            # Make sure a Stripe Session exists
-            if not session:
+        if paid_payment:
+            payment_id = paid_payment.get("id") or payment_id
+
+        def refund_and_cancel():
+            # Refund a paid reservation before cancelling it
+            if not payment_id:
                 return Response(
-                    {"message": "Cannot refund: Stripe Checkout Session not found."},
+                    {"message": "Cannot refund: PayMongo payment ID not found."},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
             # Prevent duplicate refunds
-            if reservation.stripe_refund_id:
+            if reservation.paymongo_refund_id:
                 return Response(
                     {"message": "A refund has already been initiated."},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
-            # Get the PaymentIntent associated with Checkout
-            payment_intent = session.payment_intent
+            refund = paymongo.create_refund(reservation, payment_id)
 
-            if hasattr(payment_intent, "id"):
-                payment_intent = payment_intent.id
-
-            if not payment_intent:
-                return Response(
-                    {"message": "Stripe PaymentIntent not found."},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-
-            # Create a stable idempotency key for this reservation's refund
-            idempotency_key = f"reservation-refund-{reservation.id}"
-
-            # Create a full refund through Stripe
-            refund = client.v1.refunds.create(
-                params={
-                    "payment_intent": payment_intent,
-                },
-                options={
-                    "idempotency_key": idempotency_key,
-                },
-            )
-
-            # Save the refund ID and cancel the reservation
-            reservation.stripe_refund_id = refund.id
+            reservation.paymongo_payment_id = payment_id
+            reservation.paymongo_refund_id = refund["id"]
             reservation.status = "C"
 
             reservation.save(
                 update_fields=[
-                    "stripe_refund_id",
+                    "paymongo_payment_id",
+                    "paymongo_refund_id",
                     "status",
                 ]
             )
@@ -460,29 +452,18 @@ def cancel_reservation(request, reservation_id):
                     "message": "Reservation cancelled and refund initiated.",
                     "reservation_id": str(reservation.id),
                     "status": reservation.status,
-                    "refund_status": refund.status,
+                    "refund_status": refund["status"],
                 },
                 status=status.HTTP_200_OK,
             )
 
-        # Handle pending reservations with an open Checkout Session
-        if session and session.status == "open":
+        # Handle paid reservations
+        if reservation.status == "PA" or paid_payment or payment_id:
+            return refund_and_cancel()
 
-            # Expire the existing Stripe Checkout Session
-            client.v1.checkout.sessions.expire(reservation.stripe_session_id)
-
-        # Do not cancel a completed but unpaid Checkout Session
-        elif session and session.status == "complete":
-            return Response(
-                {"message": "Checkout is complete, but payment is not yet confirmed."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        # Handle sessions already expired in Stripe
-        elif session and session.status == "expired":
-
+        # Sessions already expired in PayMongo need no further action
+        if session_attributes.get("status") == "expired":
             reservation.status = "E"
-
             reservation.save(update_fields=["status"])
 
             return Response(
@@ -492,6 +473,45 @@ def cancel_reservation(request, reservation_id):
                 },
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
+        # Expire an open hosted checkout session before cancelling
+        if reservation.paymongo_checkout_session_id:
+            try:
+                paymongo.expire_checkout_session(
+                    reservation.paymongo_checkout_session_id
+                )
+            except paymongo.PayMongoAPIError as error:
+                if error.status_code not in (400, 404):
+                    raise
+
+                # The session may have been paid between lookup and expiry
+                try:
+                    refreshed = paymongo.retrieve_checkout_session(
+                        reservation.paymongo_checkout_session_id
+                    )
+                except paymongo.PayMongoAPIError:
+                    refreshed = None
+
+                refreshed_attributes = (
+                    (refreshed or {}).get("data") or {}
+                ).get("attributes") or {}
+                refreshed_payment = paid_payment_from(refreshed_attributes)
+
+                if refreshed_payment:
+                    payment_id = refreshed_payment.get("id") or payment_id
+                    return refund_and_cancel()
+
+                if refreshed_attributes.get("status") == "expired":
+                    reservation.status = "E"
+                    reservation.save(update_fields=["status"])
+
+                    return Response(
+                        {
+                            "message": "This reservation has already expired.",
+                            "status": "E",
+                        },
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
 
         # Cancel the pending reservation
         reservation.status = "C"
@@ -507,8 +527,8 @@ def cancel_reservation(request, reservation_id):
             status=status.HTTP_200_OK,
         )
 
-    except stripe.StripeError:
-        # Avoid exposing internal Stripe error details
+    except paymongo.PayMongoError:
+        # Avoid exposing internal PayMongo error details
         return Response(
             {
                 "message": "Unable to process the cancellation or refund. Please try again."
@@ -517,7 +537,7 @@ def cancel_reservation(request, reservation_id):
         )
 
 
-# Create a Stripe Checkout Session
+# Create a PayMongo GCash Checkout Session
 @api_view(["POST"])
 @throttle_scope("checkout")
 @transaction.atomic
@@ -588,7 +608,7 @@ def create_checkout_session(request, reservation_id):
         )
 
     # Prevent creating another Checkout Session
-    if reservation.stripe_session_id:
+    if reservation.paymongo_checkout_session_id:
         return Response(
             {
                 "message": "A checkout session has already been created.",
@@ -598,74 +618,36 @@ def create_checkout_session(request, reservation_id):
         )
 
     try:
-        # Initialize Stripe using our secret key
-        client = stripe.StripeClient(settings.STRIPE_SECRET_KEY)
+        # PayMongo sessions do not auto-expire; keep the local hold deadline
+        checkout_expiration = reservation.created_at + timedelta(minutes=61)
 
-        # Use a fixed expiration based on the original reservation creation time
-        stripe_expiration = reservation.created_at + timedelta(minutes=61)
+        session = paymongo.create_checkout_session(reservation)
 
-        # Create a stable idempotency key for this reservation
-        idempotency_key = f"reservation-checkout-{reservation.id}"
-
-        # Create Stripe Checkout Session
-        session = client.v1.checkout.sessions.create(
-            params={
-                "mode": "payment",
-                "customer_email": reservation.customer_email,
-                "line_items": [
-                    {
-                        "price_data": {
-                            "currency": "php",
-                            "product_data": {
-                                "name": "Basketball Court Reservation",
-                            },
-                            # Stripe uses centavos
-                            "unit_amount": int(reservation.total_amount * 100),
-                        },
-                        "quantity": 1,
-                    }
-                ],
-                # Stripe Checkout expiration
-                "expires_at": int(stripe_expiration.timestamp()),
-                # Redirect URLs after checkout
-                "success_url": "http://localhost:8000/api/payment-success/",
-                "cancel_url": "http://localhost:8000/api/payment-cancelled/",
-                # Link payment to our reservation
-                "metadata": {
-                    "reservation_id": str(reservation.id),
-                },
-            },
-            # Reuse the same key if the same operation is retried
-            options={
-                "idempotency_key": idempotency_key,
-            },
-        )
-
-        # Save Stripe Session ID and synchronize expiration
-        reservation.expires_at = stripe_expiration
-        reservation.stripe_session_id = session.id
+        reservation.expires_at = checkout_expiration
+        reservation.paymongo_checkout_session_id = session["id"]
 
         reservation.save(
             update_fields=[
                 "expires_at",
-                "stripe_session_id",
+                "paymongo_checkout_session_id",
             ]
         )
 
         return Response(
             {
                 "message": "Checkout session created.",
-                "checkout_url": session.url,
-                "session_id": session.id,
+                "checkout_url": session["checkout_url"],
+                "session_id": session["id"],
+                "payment_method": "gcash",
             },
             status=status.HTTP_200_OK,
         )
 
-    except stripe.StripeError:
-        # Avoid exposing internal Stripe error details
+    except paymongo.PayMongoError:
+        # Avoid exposing internal PayMongo error details
         return Response(
             {
-                "message": "Unable to create the Stripe Checkout Session. Please try again."
+                "message": "Unable to create the PayMongo Checkout Session. Please try again."
             },
             status=status.HTTP_502_BAD_GATEWAY,
         )
@@ -693,172 +675,133 @@ def payment_cancelled(request):
     )
 
 
-# Receive payment notifications from Stripe
+# Receive payment notifications from PayMongo
 @csrf_exempt
-def stripe_webhook(request):
+def paymongo_webhook(request):
 
     # Only accept POST requests
     if request.method != "POST":
-        return HttpResponse(status=405)
+        return JsonResponse({"message": "Method not allowed."}, status=405)
 
-    # Get Stripe signature
-    signature = request.headers.get("stripe-signature")
+    # Verify the raw body before parsing it
+    signature = request.headers.get("Paymongo-Signature")
 
     try:
-        # Verify that the request came from Stripe
-        event = stripe.Webhook.construct_event(
-            request.body,
-            signature,
-            settings.STRIPE_WEBHOOK_SECRET,
+        payload = paymongo.verify_webhook_signature(request.body, signature)
+    except paymongo.PayMongoSignatureError:
+        return JsonResponse({"message": "Invalid webhook signature."}, status=400)
+
+    event = payload.get("data") or {}
+    event_id = event.get("id")
+    attributes = event.get("attributes") or {}
+    event_type = attributes.get("type")
+
+    if not event_id or not event_type:
+        return JsonResponse({"message": "Invalid webhook event."}, status=400)
+
+    # Ignore events belonging to the other PayMongo environment
+    expected_livemode = str(settings.PAYMONGO_SECRET_KEY or "").startswith("sk_live_")
+    if bool(attributes.get("livemode")) != expected_livemode:
+        return JsonResponse(
+            {"status": "ignored", "message": "Event from another environment."}
         )
 
-    except ValueError:
-        return HttpResponse(status=400)
-
-    except stripe.SignatureVerificationError:
-        return HttpResponse(status=400)
-
-    # Convert Stripe event into a regular Python dictionary
-    event_data = event.to_dict()
-
-    # Get event ID and type
-    event_id = event_data.get("id")
-    event_type = event_data.get("type")
-
-    # Validate required event information
-    if not event_id or not event_type:
-        return HttpResponse(status=400)
+    # Only hosted-checkout GCash payments confirm a reservation
+    if event_type != "checkout_session.payment.paid":
+        return JsonResponse({"status": "ignored", "message": "Unsupported event."})
 
     try:
         # Process and record the event in one transaction
         with transaction.atomic():
 
-            # Attempt to register the event ID
+            # Use a nested transaction to handle duplicate deliveries
             try:
-                # Use a nested transaction to handle duplicate events
                 with transaction.atomic():
-                    StripeEvent.objects.create(event_id=event_id)
-
+                    PaymongoEvent.objects.create(event_id=event_id)
             except IntegrityError:
-                # This event was already recorded
-                return HttpResponse(status=200)
+                return JsonResponse({"status": "duplicate"})
 
-            # Process supported Checkout Session events
-            if event_type in [
-                "checkout.session.expired",
-                "checkout.session.completed",
-                "checkout.session.async_payment_succeeded",
-            ]:
+            session = attributes.get("data") or {}
+            session_id = session.get("id")
+            session_attributes = session.get("attributes") or {}
+            metadata = session_attributes.get("metadata") or {}
+            reservation_id = metadata.get("reservation_id")
 
-                # Get Checkout Session data
-                session = event_data["data"]["object"]
+            paid_payment = None
 
-                # Get reservation information from Stripe metadata
-                metadata = session.get("metadata") or {}
-                reservation_id = metadata.get("reservation_id")
-                session_id = session.get("id")
+            for payment in session_attributes.get("payments") or []:
+                payment_attributes = payment.get("attributes") or {}
+                if payment_attributes.get("status") == "paid":
+                    paid_payment = payment
+                    break
 
-                # Find and lock the matching reservation
-                if reservation_id and session_id:
+            if not (session_id and reservation_id and paid_payment):
+                return JsonResponse(
+                    {"status": "ignored", "message": "No paid payment to process."}
+                )
 
-                    reservation = (
-                        Reservation.objects.select_for_update()
-                        .filter(
-                            id=reservation_id,
-                            stripe_session_id=session_id,
-                        )
-                        .first()
+            # Find and lock the matching reservation
+            reservation = (
+                Reservation.objects.select_for_update()
+                .filter(
+                    id=reservation_id,
+                    paymongo_checkout_session_id=session_id,
+                )
+                .first()
+            )
+
+            if reservation and reservation.status in ["P", "E"]:
+                payment_id = paid_payment.get("id")
+                payment_attributes = paid_payment.get("attributes") or {}
+                source = payment_attributes.get("source") or {}
+                expected_amount = paymongo.to_centavos(reservation.total_amount)
+
+                # Only accept the exact GCash payment for this reservation
+                if (
+                    not payment_id
+                    or payment_attributes.get("currency") != "PHP"
+                    or payment_attributes.get("amount") != expected_amount
+                    or source.get("type") != "gcash"
+                ):
+                    return JsonResponse(
+                        {"status": "ignored", "message": "Payment details did not match."}
                     )
 
-                    if reservation:
+                # Check whether payment arrived after expiration
+                is_late_payment = reservation.status == "E" or (
+                    reservation.expires_at
+                    and reservation.expires_at <= timezone.now()
+                )
 
-                        # Handle expired Checkout Sessions
-                        if event_type == "checkout.session.expired":
+                if is_late_payment:
 
-                            if reservation.status == "P":
-                                reservation.status = "E"
+                    # Automatically refund late payments
+                    if not reservation.paymongo_refund_id:
+                        refund = paymongo.create_refund(reservation, payment_id)
+                        reservation.paymongo_refund_id = refund["id"]
 
-                                reservation.save(update_fields=["status"])
+                    reservation.paymongo_payment_id = payment_id
+                    reservation.status = "E"
 
-                        # Handle successful payments
-                        elif session.get("payment_status") == "paid":
+                    reservation.save(
+                        update_fields=[
+                            "status",
+                            "paymongo_payment_id",
+                            "paymongo_refund_id",
+                        ]
+                    )
+                else:
+                    reservation.paymongo_payment_id = payment_id
+                    reservation.status = "PA"
 
-                            # Process unpaid or already-expired reservations
-                            if reservation.status in ["P", "E"]:
-
-                                # Check whether payment arrived after expiration
-                                is_late_payment = reservation.status == "E" or (
-                                    reservation.expires_at
-                                    and reservation.expires_at <= timezone.now()
-                                )
-
-                                # Automatically refund late payments
-                                if is_late_payment:
-
-                                    # Avoid creating another refund
-                                    if not reservation.stripe_refund_id:
-
-                                        # Get PaymentIntent from Checkout Session
-                                        payment_intent = session.get("payment_intent")
-
-                                        # Handle expanded PaymentIntent objects
-                                        if isinstance(payment_intent, dict):
-                                            payment_intent = payment_intent.get("id")
-
-                                        if not payment_intent:
-                                            raise ValueError(
-                                                "PaymentIntent missing from paid Checkout Session."
-                                            )
-
-                                        # Initialize Stripe
-                                        client = stripe.StripeClient(
-                                            settings.STRIPE_SECRET_KEY
-                                        )
-
-                                        # Use a stable refund idempotency key
-                                        idempotency_key = (
-                                            f"reservation-refund-{reservation.id}"
-                                        )
-
-                                        # Create full refund through Stripe
-                                        refund = client.v1.refunds.create(
-                                            params={
-                                                "payment_intent": payment_intent,
-                                            },
-                                            options={
-                                                "idempotency_key": idempotency_key,
-                                            },
-                                        )
-
-                                        # Save Stripe Refund ID
-                                        reservation.stripe_refund_id = refund.id
-
-                                    # Keep the reservation expired
-                                    reservation.status = "E"
-
-                                    reservation.save(
-                                        update_fields=[
-                                            "status",
-                                            "stripe_refund_id",
-                                        ]
-                                    )
-
-                                # Accept payment before expiration
-                                elif reservation.status == "P":
-
-                                    reservation.status = "PA"
-
-                                    reservation.save(update_fields=["status"])
-
-            # Save event only after processing succeeds
-            StripeEvent.objects.create(event_id=event_id)
+                    reservation.save(update_fields=["status", "paymongo_payment_id"])
 
         # Confirm successful event processing
-        return HttpResponse(status=200)
+        return JsonResponse({"status": "processed"})
 
     except Exception:
-        # Return an error so Stripe can retry the event
-        return HttpResponse(status=500)
+        # Return an error so PayMongo can retry the event
+        return JsonResponse({"message": "Webhook processing failed."}, status=500)
 
 
 # Retrieve a customer's reservation history

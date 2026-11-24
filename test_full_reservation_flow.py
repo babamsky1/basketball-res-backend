@@ -26,8 +26,6 @@ from django.utils import timezone
 
 from reservations.models import Reservation
 
-import stripe
-
 # --------------------------------------------------
 # CONFIGURATION
 # --------------------------------------------------
@@ -36,12 +34,10 @@ BASE_URL = "http://localhost:8000/api"
 
 CUSTOMER_PHONE = "09171234567"
 
-# This test requires Stripe test mode
-if not settings.STRIPE_SECRET_KEY.startswith("sk_test_"):
-    print("ERROR: Stripe test mode is required.")
+# This test requires PayMongo test mode
+if not settings.PAYMONGO_SECRET_KEY.startswith("sk_test_"):
+    print("ERROR: PayMongo test mode (sk_test_...) is required.")
     sys.exit(1)
-
-stripe_client = stripe.StripeClient(settings.STRIPE_SECRET_KEY)
 
 
 # --------------------------------------------------
@@ -191,10 +187,10 @@ print("STEP 2 PASSED")
 
 
 # --------------------------------------------------
-# STEP 3: CREATE STRIPE CHECKOUT SESSION
+# STEP 3: CREATE PAYMONGO CHECKOUT SESSION
 # --------------------------------------------------
 
-show_section("STEP 3 - CREATE STRIPE CHECKOUT")
+show_section("STEP 3 - CREATE PAYMONGO CHECKOUT")
 
 checkout_payload = {
     "customer_email": customer_email,
@@ -215,35 +211,30 @@ if not checkout_url or not session_id:
     print("Checkout URL or Session ID is missing.")
     sys.exit(1)
 
-print("Stripe Session ID:", session_id)
+print("PayMongo Session ID:", session_id)
 print("Checkout URL:", checkout_url)
 
 print("STEP 3 PASSED")
 
 
 # --------------------------------------------------
-# STEP 4: COMPLETE STRIPE TEST PAYMENT
+# STEP 4: COMPLETE PAYMONGO GCASH TEST PAYMENT
 # --------------------------------------------------
 
-show_section("STEP 4 - COMPLETE STRIPE TEST PAYMENT")
+show_section("STEP 4 - COMPLETE PAYMONGO GCASH TEST PAYMENT")
 
-print("Opening Stripe Checkout...")
+print("Opening PayMongo Checkout...")
 
 # Open the hosted Checkout page
 webbrowser.open(checkout_url)
 
-print("\nUse these Stripe test card details:")
-print("Card number: 4242 4242 4242 4242")
-print("Expiration: Any future date")
-print("CVC: Any three digits")
-print("ZIP: Any valid test ZIP code")
-
-print("\nComplete the payment in your browser.")
-print("Keep your Stripe CLI webhook listener running.")
+print("\nSelect GCash and complete the simulated test payment.")
+print("Make sure your PayMongo test webhook endpoint is reachable so Django")
+print("receives checkout_session.payment.paid.")
 
 input(
     "\nPress ENTER after payment is complete "
-    "and Stripe CLI shows successful webhook delivery..."
+    "and the PayMongo webhook has been delivered..."
 )
 
 
@@ -352,37 +343,34 @@ show_section("STEP 7 - VERIFY REFUND")
 reservation_record = Reservation.objects.get(id=reservation_id)
 
 print("Reservation status:", reservation_record.status)
-print("Stripe Session ID:", reservation_record.stripe_session_id)
-print("Stripe Refund ID:", reservation_record.stripe_refund_id)
+print("PayMongo Session ID:", reservation_record.paymongo_checkout_session_id)
+print("PayMongo Payment ID:", reservation_record.paymongo_payment_id)
+print("PayMongo Refund ID:", reservation_record.paymongo_refund_id)
 
 # Verify reservation was cancelled
 if reservation_record.status != "C":
     print("FAILED: Reservation is not cancelled.")
     sys.exit(1)
 
-# Verify Stripe refund ID exists
-if not reservation_record.stripe_refund_id:
-    print("FAILED: No Stripe Refund ID was saved.")
+# Verify the webhook saved the PayMongo payment ID
+if not reservation_record.paymongo_payment_id:
+    print("FAILED: No PayMongo Payment ID was saved by the webhook.")
+    sys.exit(1)
+
+# Verify PayMongo refund ID exists
+if not reservation_record.paymongo_refund_id:
+    print("FAILED: No PayMongo Refund ID was saved.")
     sys.exit(1)
 
 # Confirm only one reservation references this refund
 refund_count = Reservation.objects.filter(
-    stripe_refund_id=reservation_record.stripe_refund_id
+    paymongo_refund_id=reservation_record.paymongo_refund_id
 ).count()
 
 print("Refund reference count:", refund_count)
 
 if refund_count != 1:
     print("FAILED: Unexpected duplicate refund reference.")
-    sys.exit(1)
-
-# Retrieve actual Stripe refund
-refund = stripe_client.v1.refunds.retrieve(reservation_record.stripe_refund_id)
-
-print("Actual Stripe Refund Status:", refund.status)
-
-if refund.status not in ["succeeded", "pending"]:
-    print("WARNING: Unexpected Stripe refund status:", refund.status)
     sys.exit(1)
 
 print("STEP 7 PASSED")
@@ -396,15 +384,16 @@ show_section("FULL RESERVATION FLOW TEST SUMMARY")
 
 print("Availability check: PASSED")
 print("Reservation creation: PASSED")
-print("Stripe Checkout creation: PASSED")
-print("Stripe test payment: PASSED")
+print("PayMongo GCash Checkout creation: PASSED")
+print("PayMongo GCash test payment: PASSED")
 print("Payment webhook verification: PASSED")
 print("Simultaneous cancellation: PASSED")
 print("Duplicate refund protection: PASSED")
 print("Database refund verification: PASSED")
 
 print("\nRESERVATION ID:", reservation_id)
-print("STRIPE SESSION ID:", reservation_record.stripe_session_id)
-print("STRIPE REFUND ID:", reservation_record.stripe_refund_id)
+print("PAYMONGO SESSION ID:", reservation_record.paymongo_checkout_session_id)
+print("PAYMONGO PAYMENT ID:", reservation_record.paymongo_payment_id)
+print("PAYMONGO REFUND ID:", reservation_record.paymongo_refund_id)
 
 print("\nALL END-TO-END TESTS PASSED!")

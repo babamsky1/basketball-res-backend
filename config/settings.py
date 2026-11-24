@@ -18,8 +18,20 @@ from dotenv import load_dotenv
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 load_dotenv(BASE_DIR / ".env")
-STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
-STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
+
+# PayMongo credentials and endpoints (GCash hosted checkout)
+PAYMONGO_SECRET_KEY = os.getenv("PAYMONGO_SECRET_KEY", "")
+PAYMONGO_WEBHOOK_SECRET = os.getenv("PAYMONGO_WEBHOOK_SECRET", "")
+PAYMONGO_API_BASE = os.getenv("PAYMONGO_API_BASE", "https://api.paymongo.com")
+PAYMONGO_SUCCESS_URL = os.getenv(
+    "PAYMONGO_SUCCESS_URL", "http://localhost:8000/api/payment-success/"
+)
+PAYMONGO_CANCEL_URL = os.getenv(
+    "PAYMONGO_CANCEL_URL", "http://localhost:8000/api/payment-cancelled/"
+)
+PAYMONGO_WEBHOOK_TOLERANCE_SECONDS = int(
+    os.getenv("PAYMONGO_WEBHOOK_TOLERANCE_SECONDS", "300")
+)
 
 
 # Quick-start development settings - unsuitable for production
@@ -158,7 +170,7 @@ REST_FRAMEWORK = {
         "reservation_creation": "10/hour",
         # Availability checking
         "availability_check": "60/hour",
-        # Stripe Checkout creation
+        # PayMongo Checkout creation
         "checkout": "10/hour",
     },
 }

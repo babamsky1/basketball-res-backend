@@ -41,16 +41,24 @@ class Reservation(models.Model):
         default="P",
     )
 
-    # Each Stripe Checkout Session can belong to only one reservation
-    stripe_session_id = models.CharField(
+    # Each PayMongo Checkout Session can belong to only one reservation
+    paymongo_checkout_session_id = models.CharField(
         max_length=255,
         blank=True,
         null=True,
         unique=True,
     )
 
-    # Each Stripe Refund ID can belong to only one reservation
-    stripe_refund_id = models.CharField(
+    # PayMongo Payment ID is required when refunding a paid checkout
+    paymongo_payment_id = models.CharField(
+        max_length=255,
+        blank=True,
+        null=True,
+        unique=True,
+    )
+
+    # Each PayMongo Refund ID can belong to only one reservation
+    paymongo_refund_id = models.CharField(
         max_length=255,
         blank=True,
         null=True,
@@ -102,9 +110,9 @@ class Reservation(models.Model):
         return f"{self.customer_name} - {self.reservation_date}"
 
 
-class StripeEvent(models.Model):
+class PaymongoEvent(models.Model):
 
-    # Unique Stripe event ID prevents duplicate event records
+    # Unique PayMongo event ID prevents duplicate event records
     event_id = models.CharField(max_length=255, unique=True)
 
     # Record when this event was received
