@@ -1,0 +1,55 @@
+import json
+import urllib.request
+import urllib.error
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
+
+# Checkout endpoint for the same reservation
+API_URL = (
+    "http://localhost:8000/api/reservations/"
+    "70aa54c0-043e-4ac2-ab03-832ad7647d89/checkout/"
+)
+
+# Correct customer credentials
+payload = {
+    "customer_email": "checkouttest@gmail.com",
+    "customer_phone": "09171234567",
+}
+
+# Make both requests start together
+start_barrier = Barrier(2)
+
+
+def send_checkout():
+    # Wait until both requests are ready
+    start_barrier.wait()
+
+    # Prepare the POST request
+    request = urllib.request.Request(
+        API_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        # Send Checkout request
+        with urllib.request.urlopen(request, timeout=60) as response:
+            return response.status, response.read().decode("utf-8")
+
+    except urllib.error.HTTPError as error:
+        return error.code, error.read().decode("utf-8")
+
+    except Exception as error:
+        return "ERROR", str(error)
+
+
+# Execute two Checkout requests concurrently
+with ThreadPoolExecutor(max_workers=2) as executor:
+    results = list(executor.map(lambda _: send_checkout(), range(2)))
+
+# Display both responses
+for index, (status_code, response_body) in enumerate(results, start=1):
+    print(f"\nRequest {index}")
+    print(f"Status: {status_code}")
+    print(f"Response: {response_body}")
